@@ -34,6 +34,8 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.ArrayList;
+import java.util.List;
 
 public class FloatingService extends Service {
     private static final String CHANNEL_ID = "LiveAudioTranslatorChannel";
@@ -49,7 +51,9 @@ public class FloatingService extends Service {
     private String apiKey = "";
     private String targetLang = "Burmese";
     private boolean isSlang = true;
-    private String activeModel = "";
+
+    private final List<String> modelList = new ArrayList<>();
+    private volatile int currentModelIdx = 0;
 
     @Override
     public void onCreate() {
@@ -107,7 +111,7 @@ public class FloatingService extends Service {
             MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
             if (mpm != null && data != null) {
                 mediaProjection = mpm.getMediaProjection(resultCode, data);
-                detectModelAndStart();
+                detectModelsAndStart();
             } else {
                 updateSubtitle("Error: MediaProjection မရပါ");
             }
@@ -115,8 +119,14 @@ public class FloatingService extends Service {
         return START_NOT_STICKY;
     }
 
-    private void detectModelAndStart() {
+    private void detectModelsAndStart() {
         new Thread(() -> {
+            modelList.clear();
+            // နောက်ဆုံးပေါ် Model များကို ဦးစားပေးထည့်သွင်းခြင်း
+            modelList.add("models/gemini-2.5-flash");
+            modelList.add("models/gemini-2.5-flash-lite");
+            modelList.add("models/gemini-flash-latest");
+
             try {
                 URL url = new URL("https://generativelanguage.googleapis.com/v1beta/models?key=" + apiKey);
                 HttpURLConnection conn = (HttpURLConnection) url.openConnection();
@@ -126,36 +136,34 @@ public class FloatingService extends Service {
                     String body = readStream(conn.getInputStream());
                     JSONObject json = new JSONObject(body);
                     JSONArray models = json.getJSONArray("models");
-                    String fallback = "";
 
-                    for (int i = 0; i < models.length(); i++) {
+                    for (int i = models.length() - 1; i >= 0; i--) {
                         JSONObject m = models.getJSONObject(i);
                         String name = m.getString("name");
                         String methods = m.optString("supportedGenerationMethods", "");
-                        if (methods.contains("generateContent")) {
-                            if (name.contains("flash") && !name.contains("tts") && !name.contains("image")) {
-                                activeModel = name;
-                                break;
-                            }
-                            if (fallback.isEmpty() && name.contains("gemini")) {
-                                fallback = name;
-                            }
+                        if (methods.contains("generateContent")
+                                && name.contains("flash")
+                                && !name.contains("tts")
+                                && !name.contains("image")
+                                && !name.contains("exp")
+                                && !modelList.contains(name)) {
+                            modelList.add(name);
                         }
                     }
-                    if (activeModel.isEmpty()) activeModel = fallback;
                 }
-
-                if (activeModel.isEmpty()) {
-                    activeModel = "models/gemini-2.5-flash";
-                }
-                updateSubtitle("အသံနားထောင်နေသည်... (" + activeModel.replace("models/", "") + ")");
-                startAudioCapture();
-            } catch (Exception e) {
-                activeModel = "models/gemini-2.5-flash";
-                updateSubtitle("အသံနားထောင်နေသည်...");
-                startAudioCapture();
+            } catch (Exception ignored) {
             }
+
+            currentModelIdx = 0;
+            updateSubtitle("အသံနားထောင်နေသည်... (" + getActiveModel().replace("models/", "") + ")");
+            startAudioCapture();
         }).start();
+    }
+
+    private String getActiveModel() {
+        if (modelList.isEmpty()) return "models/gemini-2.5-flash";
+        if (currentModelIdx >= modelList.size()) currentModelIdx = 0;
+        return modelList.get(currentModelIdx);
     }
 
     private void startForegroundNotification() {
@@ -235,12 +243,155 @@ public class FloatingService extends Service {
     private void sendToGemini(byte[] wavData) {
         new Thread(() -> {
             try {
+                String modelName = getActiveModel();
                 String base64Audio = Base64.encodeToString(wavData, Base64.NO_WRAP);
                 String stylePrompt = isSlang
                         ? "Translate into natural, raw, uncensored slang/colloquial " + targetLang + " (keep vulgar/profane tone if present)."
                         : "Translate into natural, polite " + targetLang + ".";
 
                 String prompt = "Listen to this audio clip. " + stylePrompt +
+                        " Output ONLY the translated subtitle text. If there is no speech, output nothing.";
+
+                JSONObject inlineData = new JSONObject();
+                inlineData.put("mimeType", "audio/wav");
+                inlineData.put("data", base64Audio);
+
+                JSONArray parts = new JSONArray();
+                parts.put(new JSONObject().put("text", prompt));
+                parts.put(new JSONObject().put("inlineData", inlineData));
+
+                JSONObject content = new JSONObject();
+                content.put("parts", parts);
+
+                JSONArray safetySettings = new JSONArray();
+                String[] categories = {
+                    "HARM_CATEGORY_HARASSMENT",
+                    "HARM_CATEGORY_HATE_SPEECH",
+                    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                    "HARM_CATEGORY_DANGEROUS_CONTENT"
+                };
+                for (String cat : categories) {
+                    JSONObject s = new JSONObject();
+                    s.put("category", cat);
+                    s.put("threshold", "BLOCK_NONE");
+                    safetySettings.put(s);
+                }
+
+                JSONObject payload = new JSONObject();
+                payload.put("contents", new JSONArray().put(content));
+                payload.put("safetySettings", safetySettings);
+
+                URL url = new URL("https://generativelanguage.googleapis.com/v1beta/" + modelName + ":generateContent?key=" + apiKey);
+                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn.setRequestMethod("POST");
+                conn.setRequestProperty("Content-Type", "application/json");
+                conn.setDoOutput(true);
+
+                try (OutputStream os = conn.getOutputStream()) {
+                    os.write(payload.toString().getBytes("UTF-8"));
+                }
+
+                int code = conn.getResponseCode();
+                if (code == 200) {
+                    String body = readStream(conn.getInputStream());
+                    JSONObject resp = new JSONObject(body);
+                    if (resp.has("candidates")) {
+                        JSONObject cand = resp.getJSONArray("candidates").getJSONObject(0);
+                        if (cand.has("content")) {
+                            String text = cand.getJSONObject("content")
+                                    .getJSONArray("parts")
+                                    .getJSONObject(0)
+                                    .getString("text")
+                                    .trim();
+                            if (!text.isEmpty()) {
+                                updateSubtitle(text);
+                            }
+                        }
+                    }
+                } else if (code == 404 && currentModelIdx + 1 < modelList.size()) {
+                    currentModelIdx++;
+                    updateSubtitle("Model ပြောင်းနေသည်: " + getActiveModel().replace("models/", ""));
+                } else {
+                    String err = readStream(conn.getErrorStream());
+                    updateSubtitle("API " + code + ": " + (err.length() > 60 ? err.substring(0, 60) : err));
+                }
+            } catch (Exception e) {
+                updateSubtitle("Net Error: " + e.getMessage());
+            }
+        }).start();
+    }
+
+    private String readStream(InputStream is) throws Exception {
+        if (is == null) return "";
+        BufferedReader br = new BufferedReader(new InputStreamReader(is));
+        StringBuilder sb = new StringBuilder();
+        String line;
+        while ((line = br.readLine()) != null) sb.append(line);
+        br.close();
+        return sb.toString();
+    }
+
+    private byte[] addWavHeader(byte[] pcm) {
+        int totalDataLen = pcm.length + 36;
+        int byteRate = SAMPLE_RATE * 2;
+        byte[] header = new byte[44];
+        header[0] = 'R'; header[1] = 'I'; header[2] = 'F'; header[3] = 'F';
+        header[4] = (byte) (totalDataLen & 0xff);
+        header[5] = (byte) ((totalDataLen >> 8) & 0xff);
+        header[6] = (byte) ((totalDataLen >> 16) & 0xff);
+        header[7] = (byte) ((totalDataLen >> 24) & 0xff);
+        header[8] = 'W'; header[9] = 'A'; header[10] = 'V'; header[11] = 'E';
+        header[12] = 'f'; header[13] = 'm'; header[14] = 't'; header[15] = ' ';
+        header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0;
+        header[20] = 1; header[21] = 0;
+        header[22] = 1; header[23] = 0;
+        header[24] = (byte) (SAMPLE_RATE & 0xff);
+        header[25] = (byte) ((SAMPLE_RATE >> 8) & 0xff);
+        header[26] = (byte) ((SAMPLE_RATE >> 16) & 0xff);
+        header[27] = (byte) ((SAMPLE_RATE >> 24) & 0xff);
+        header[28] = (byte) (byteRate & 0xff);
+        header[29] = (byte) ((byteRate >> 8) & 0xff);
+        header[30] = (byte) ((byteRate >> 16) & 0xff);
+        header[31] = (byte) ((byteRate >> 24) & 0xff);
+        header[32] = 2; header[33] = 0;
+        header[34] = 16; header[35] = 0;
+        header[36] = 'd'; header[37] = 'a'; header[38] = 't'; header[39] = 'a';
+        header[40] = (byte) (pcm.length & 0xff);
+        header[41] = (byte) ((pcm.length >> 8) & 0xff);
+        header[42] = (byte) ((pcm.length >> 16) & 0xff);
+        header[43] = (byte) ((pcm.length >> 24) & 0xff);
+
+        byte[] wav = new byte[44 + pcm.length];
+        System.arraycopy(header, 0, wav, 0, 44);
+        System.arraycopy(pcm, 0, wav, 44, pcm.length);
+        return wav;
+    }
+
+    private void updateSubtitle(String text) {
+        new Handler(Looper.getMainLooper()).post(() -> subtitleView.setText(text));
+    }
+
+    @Override
+    public void onDestroy() {
+        isRunning = false;
+        if (audioRecord != null) {
+            try { audioRecord.stop(); audioRecord.release(); } catch (Exception ignored) {}
+        }
+        if (mediaProjection != null) {
+            try { mediaProjection.stop(); } catch (Exception ignored) {}
+        }
+        if (floatingView != null) {
+            windowManager.removeView(floatingView);
+        }
+        super.onDestroy();
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
+}
+isten to this audio clip. " + stylePrompt +
                         " Output ONLY the translated subtitle text. If there is no speech, output nothing.";
 
                 JSONObject inlineData = new JSONObject();
